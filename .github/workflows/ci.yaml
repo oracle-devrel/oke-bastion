@@ -1,9 +1,6 @@
 name: CI - Deploy to OKE
 
-on:
-  push:
-    branches:
-      - dev
+on: [push]
 
 jobs:
   deploy:   
