@@ -1,0 +1,116 @@
+name: CI - Deploy to OKE
+
+on: [push]
+
+jobs:
+  deploy:   
+    runs-on: ubuntu-20.04
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+    steps:
+      - name: Check OCI CLI installation
+        run: |  
+          if ! command -v oci &> /dev/null; then
+            echo "OCI CLI not found, installing..."
+            # Continue with the installation steps
+            curl -L -O https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+            chmod +x install.sh
+            ./install.sh --accept-all-defaults
+            mv ~/bin/oci /usr/local/bin
+            oci --version 
+          else
+            echo "OCI CLI already installed"
+          fi
+        
+      - name: Setup SSH
+        run: |                    
+          echo "---------------------------------------------------------------"
+          echo "Configure SSH Tunnel to OKE Cluster"
+          echo "---------------------------------------------------------------"
+
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N "" -y
+          ssh-keyscan -H ${{ secrets.BASTION_HOST }} >> ~/.ssh/known_hosts
+
+          cat ~/.ssh/id_rsa.pub | tr -d '\n' > ~/.ssh/id_rsa_updated.pub
+          export ssh_public_key="~/.ssh/id_rsa_updated.pub"
+          export private_key="~/.ssh/id_rsa"
+          echo "" > ~/.ssh/config
+          echo "Host ${{ secrets.BASTION_HOST }}" >> ~/.ssh/config
+          echo "    IdentityFile ~/.ssh/id_rsa" >> ~/.ssh/config
+          echo "    HostkeyAlgorithms +ssh-rsa" >> ~/.ssh/config
+          echo "    StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "    KexAlgorithms +diffie-hellman-group14-sha1" >> ~/.ssh/config
+          echo "    MACs +hmac-sha1" >> ~/.ssh/config
+          echo "    PubkeyAcceptedKeyTypes +ssh-rsa" >> ~/.ssh/config
+          echo "    PubkeyAcceptedAlgorithms +ssh-rsa" >> ~/.ssh/config
+          echo "Host *" >> ~/.ssh/config
+          echo "    IdentityFile ~/.ssh/id_rsa" >> ~/.ssh/config
+          echo "    HostkeyAlgorithms +ssh-rsa" >> ~/.ssh/config
+          echo "    StrictHostKeyChecking no" >> ~/.ssh/config
+          echo "    KexAlgorithms +diffie-hellman-group14-sha1" >> ~/.ssh/config
+          echo "    MACs +hmac-sha1" >> ~/.ssh/config
+          echo "    PubkeyAcceptedKeyTypes +ssh-rsa" >> ~/.ssh/config
+          echo "    PubkeyAcceptedAlgorithms +ssh-rsa" >> ~/.ssh/config
+          
+          ls -l ~/.ssh/
+
+      - name: Create Bastion Session
+        run: |
+          export oke_private_ip=`oci ce cluster get --cluster-id ${{ vars.OKE_CLUSTER_OCID }} --query 'data.endpoints."private-endpoint"' | grep -E -o "([0-9]{1,3}[\.]){3}[0-9]{1,3}"`
+          echo "oke_private_ip=$oke_private_ip" >> "$GITHUB_ENV"
+          oci bastion session create-port-forwarding --bastion-id ${{ secrets.BASTION_OCID }} --display-name ga-to-oke-tunnel --ssh-public-key-file ~/.ssh/id_rsa_updated.pub --key-type PUB --target-private-ip $oke_private_ip --target-port 6443 --wait-for-state SUCCEEDED > ~/bastion_session.json
+          export bastion_session_ocid=`cat ~/bastion_session.json | grep bastionsession | awk '{print $2}' | tail -1 | tr -d '"'`          
+          echo "bastion_session_ocid=$bastion_session_ocid" >> "$GITHUB_ENV"
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo chmod 755 kubectl
+          sudo mv kubectl /usr/local/bin
+
+      - name: Start SSH Tunnel to OKE Cluster
+        run: |          
+          ssh -o PubkeyAcceptedKeyTypes=+ssh-rsa -i ~/.ssh/id_rsa -fN -L 6443:${{ env.oke_private_ip }}:6443 -p 22 ${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }} -v 
+          while [ $? != 0 ]
+          do
+          echo "---------------------------------------------------------------"
+          echo "Attempting again"
+          echo "---------------------------------------------------------------"
+          ssh -o PubkeyAcceptedKeyTypes=+ssh-rsa -i ~/.ssh/id_rsa -fN -L 6443:${{ env.oke_private_ip }}:6443 -p 22 ${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }} -v 
+          done
+
+      - name: Configure OKE Cluster
+        run: |
+          oci ce cluster create-kubeconfig --cluster-id ${{ vars.OKE_CLUSTER_OCID }} --file $HOME/.kube/config --region ${{ secrets.OCI_CLI_REGION }} --token-version 2.0.0  --kube-endpoint PRIVATE_ENDPOINT          
+          sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" $HOME/.kube/config
+          sleep 5
+          kubectl cluster-info
+          if [ $? == 0 ]
+          then
+            echo "---------------------------------------------------------------"
+            echo "Successfully Connected to your Private OKE Cluster"
+            echo "---------------------------------------------------------------"
+          else
+            echo "---------------------------------------------------------------"
+            echo "Unable to Authenticate with Private OKE Cluster"
+            echo "---------------------------------------------------------------"
+          fi
+
+      - name: Deploy to OKE
+        run: |
+          ls -l
+          kubectl get ns | grep -c "^nginx" || kubectl create namespace nginx
+          kubectl apply -f https://k8s.io/examples/application/deployment.yaml
+
+      - name: Delete OCI Bastion Session
+        run: |
+          sleep 5
+          echo "---------------------------------------------------------------"
+          echo "Deleting OCI Bastion Session"
+          echo "---------------------------------------------------------------"
+          export bastion_session_ocid=`cat ~/bastion_session.json | grep bastionsession | awk '{print $2}' | tail -1 | tr -d '"'`
+          oci bastion session delete --session-id $bastion_session_ocid --force      
